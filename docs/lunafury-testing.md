@@ -15,6 +15,104 @@ LUNA33 runtime identities `0x0032` and `0x0033` on that firmware. TYPE33
 identities and packet layouts are source-verified but have not been tested
 on hardware.
 
+On 2026-10-08 the owner also confirmed the next round on LUNA33, firmware
+`0.0.26.0`, over both cable and 8K receiver: independent button polling,
+DPI stage management including X/Y axes, and all three onboard profiles
+worked normally. The owner subsequently confirmed mouse/scroll/DPI/media
+remapping, keyboard single keys and combinations on the same model, firmware
+and both connections. The owner further confirmed all four receiver light modes,
+absence of lighting controls over cable, sleep/Never over both connections,
+bank switching and reconnect readback. The redesigned official-style DPI UI
+was confirmed on 2026-10-08 by the owner on LUNA33, firmware 0.0.26.0,
+over both cable and 8K: stage selection, value editing, separate axes, stage
+count changes and reconnect readback all worked. No separate Games or
+power-cycle results were supplied.
+
+## Bottom-button power / DPI behavior (2026-10-09, hardware unverified)
+
+At the owner's request, the three added fixed actions (left double click,
+browser refresh and open browser) were withdrawn. They are absent from the
+official default menu. The previous verified DPI interface is retained.
+No hardware binding is automatically restored or overwritten by this rollback;
+existing removed assignments become unknown/read-only.
+
+The current official `settingDialog.vue` exposes two bottom-button modes:
+1. Short press: power on/off.
+2. Long press: power on/off; short press: DPI.
+
+`XviUpdater.getDpiPowerMode(profile)` reads target 2, page 3, command 0x80,
+length 6, selector `[profile, 0x14]`. Its setter writes:
+- Mode 1: length 5, `[profile, 0x14, 0, 0x15, 1]`.
+- Mode 2: length 6, `[profile, 0x14, 0, 7, 1, 6]`.
+
+The special five-byte power binding is not encoded as an ordinary button.
+The read validates bank, selector, function and data rather than treating
+every unknown function as mode 2 as the vendor UI does. Unsupported,
+truncated and unfamiliar bindings stay hidden and cannot be overwritten.
+Writes reread the existing binding, run through the onboard operation
+queue, and confirm the exact selected mode. Ordinary buttons and other
+banks are not written. Other brands cannot call this setter.
+
+The card is on the Buttons page and uses staged Apply/undo. The setting
+belongs to the current onboard bank but is deliberately excluded from
+Games and profile imports so automatic game changes cannot alter power
+button behavior. Changing the setting configures the binding; it does not
+execute a power-off command. Both actual press behavior and persistence
+after a power cycle are unverified; TYPE33 remains unverified.
+
+Test on LUNA33 over cable and 8K with a backup pointing device available:
+record each bank's original mode, compare with the official driver, apply
+both modes, check physical short/long presses, reconnect/readback and bank
+isolation, then restore the originals. Switching the mouse off may
+disconnect it; turn it on again and reconnect before continuing.
+
+## Official-style DPI editor (2026-10-08)
+
+At the owner's request, the custom DPI color extension was withdrawn. The
+LunaFury client no longer exposes a color setter or reads/writes the page-2
+color table. Other brands' color support is unchanged. A regression test
+checks that status reads and stage-count edits send no color-table commands.
+
+The app uses the official driver's fixed index palette, active-stage X/Y
+sliders, stage-value inputs and an explicit stage-count selector. Clicking a
+tile or focusing an input selects that stage. Numeric inputs clamp to
+50–30000 and round down in 50-DPI steps. The existing staged Apply workflow,
+serialized bank operations and readback-confirmed writes are preserved.
+Stage-count changes retain dormant device values as before.
+
+Hardware retest: verify tile selection, value inputs, current-stage sliders,
+linked/separate axes, count shrink/expansion, undo/Apply and reconnect in
+each onboard bank over cable and 8K. Fixed color tiles are display markers,
+not device color readback. No firmware/reset actions are included.
+
+## Receiver lighting and Never auto-sleep (2026-10-08)
+
+Re-inspection of the same vendor bundles found `SetLightEffect(1, mode)` and
+`GetLightEffect(1)`. These address the receiver, not the active onboard bank:
+target 0 for LUNA33 PID `0x0033`, target 1 for TYPE33 PID `0x0084`.
+Page 2, command `0x80` reads six bytes with zone argument 1; command 0 writes
+`[1, 0, mode, 0, 0, 0]`. Mode is payload byte 2: 2 = Mixed, 6 = Battery,
+11 = DPI, 0 = Off. Wired identities never receive these commands. Unknown,
+unsupported and truncated reads do not expose a control. Writes require a
+supported pre-read and exact readback; stale zone replies are filtered.
+This receiver-global setting is deliberately excluded from Games profiles.
+
+Vendor `getSleepTime(profile)` reads page 0 command `0x87`; `setSleepTime`
+writes command 7, three bytes `[profile, secondsHigh, secondsLow]`. The UI
+offers 1–30 minutes, converting zero minutes to `0xffff` for Never. OpenMouse
+represents Never as zero seconds and preserves custom normal timeouts; zero
+wire values and other reserved values are not guessed. Only LunaFury uses this
+conversion. Sleep edits share the onboard-operation queue with profile
+switches and filter replies by profile before verifying the decoded timeout.
+
+Hardware checklist: record the current receiver mode and each bank's timeout.
+On the 8K receiver, apply Mixed/Battery/DPI/Off individually, inspect the LED,
+and reconnect to verify readback. Cable connections must not show lighting.
+For each connection, set a short sleep timeout, confirm actual idle sleep,
+then choose Never and wait beyond that timeout without using the mouse.
+Switch banks to check isolation, restore original values, and compare with
+the vendor configurator (never run both configurators concurrently).
+
 The owner has not supplied separate results for power-cycle persistence,
 other firmware versions, or native-Bridge end-to-end testing. The stated
 Corded/20 kHz behavior has not been independently measured.
@@ -121,6 +219,44 @@ Each profile restores only the controls it changed, preserving unrelated
 settings and valid zero values.
 
 ## Required hardware check
+
+### Onboard controls and button remapping
+
+The public configurator's runtime controls use profile IDs 1–3. Button scan
+rate is page 0, read `0x9f` / write `0x1f`, with codes 1/32/64/128 for
+1000/2000/4000/8000 Hz. LUNA33 cable offers only 1000 Hz. DPI stages use
+page 1, read `0x81` / write `0x01`, with a 26-byte table; active stage is
+read `0x82` / write `0x02`. Separate axes use `0x8d` / `0x0d`. Active
+profile uses page 0, read `0x85` / write `0x05`.
+
+Button remapping uses page 3, read `0x80` / write `0x00`. The payload is
+`[profile, button, 0, function, dataLength, ...data]`. Reads request
+function `0xff`, data length 10 and envelope length 15. Physical IDs 1–5
+are left, right, middle, back and forward. Mouse actions use function 1;
+keyboard shortcuts use function 4 with `[modifierMask, HIDusage]`; media
+actions use function 5 with a big-endian consumer usage; DPI actions use
+function 7. Disabled is function 0 with no data. Receiver buttons,
+bottom controls, macros and vendor-specific advanced actions are excluded
+from ordinary remapping. Bottom-button behavior has its separate control
+described above.
+
+The owner confirmed ordinary remapping on LUNA33 firmware `0.0.26.0` over
+both cable and the 8K receiver, as recorded above. TYPE33 remapping remains
+source-derived and synthetically tested only. Left is protected. Macros and
+unknown assignments remain read-only; no macro
+storage or unrelated button is rewritten. Each write addresses the active
+bank, reads the prior assignment, and checks the complete function/data
+readback. Reads match both profile and physical button. Profile switching
+and remapping share the serialized onboard-operation queue. Games profiles
+capture and restore only the supported buttons they touched.
+
+For hardware testing, record the current bank and assignments. Change right,
+middle or a side button to a reversible mouse action first, then test scroll,
+DPI, a single key, a shortcut and a media action. Check the actual output,
+refresh/reconnect readback and bank isolation, then restore the originals.
+Check that a macro configured in the official driver stays unchanged.
+Games apply/restore needs a separate pass; a successful readback alone does
+not prove that the bound key or action fires correctly.
 
 Connect each available cable/receiver identity in Chromium and confirm:
 

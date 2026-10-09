@@ -37,7 +37,9 @@ function fakeLunaFury(productId = 0x0033, options: {
       const page = packet[4]!, command = packet[5]!, profile = packet[6]!;
       const key = `${page}:${command}`;
       const reply = new Uint8Array(64);
-      reply[0] = options.unsupported && EXTRA_READS.has(key) ? 0xa2 : 0xa1;
+      // This fixture covers the original extras; onboard controls have a
+      // separate fixture with independent profiles, axes and stage tables.
+      reply[0] = key === "1:141" || key === "0:159" || options.unsupported && EXTRA_READS.has(key) ? 0xa2 : 0xa1;
       reply[4] = page; reply[5] = command;
       let payload: number[] = [profile, 0];
       if (key === "0:133") payload = [3];
@@ -45,7 +47,7 @@ function fakeLunaFury(productId = 0x0033, options: {
       if (key === "0:131") payload = [0, 80];
       if (key === "0:135") payload = [profile, 1, 44];
       if (key === "1:129") payload = [profile, 1, 3, 32, 3, 32];
-      if (key === "1:128" || key === "1:136") payload = [profile, 1];
+      if (key === "1:128" || key === "1:130" || key === "1:136") payload = [profile, 1];
       if (key === "1:148") payload = [profile, state.angle & 255];
       if (key === "0:152") payload = [profile, state.lightning, 0, 0];
       if (key === "0:146") payload = [profile, 0, packet[8]!, 0, state.latency[packet[8]!]!, ...Array(14).fill(0)];

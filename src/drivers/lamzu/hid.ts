@@ -19,10 +19,39 @@ import {
   lunafuryDecodeLightning,
   lunafuryDecodeButtonDebounce,
   lunafuryDecodeWheelGuard,
+  LUNAFURY_ONBOARD_READ,
+  LUNAFURY_ONBOARD_WRITE,
+  LUNAFURY_DPI_DEFAULTS,
+  lunafuryDecodeButtonRate,
+  lunafuryDecodeSeparateAxes,
+  lunafuryDecodeDpiStages,
+  lunafuryValidateDpi,
+  lunafuryWriteDpiStages,
+  LUNAFURY_BUTTON_IDS,
+  LUNAFURY_BUTTON_ACTIONS,
+  lunafuryButtonActionWritable,
+  lunafuryDecodeButton,
+  lunafuryDecodeButtonAction,
+  lunafuryIsMappedButton,
+  lunafuryReadButton,
+  lunafuryWriteButton,
+  type LunaFuryButtonPollingRate,
   type LunaFuryButton,
   type LunaFuryLightningMode,
   type LunaFurySettings,
   type LunaFuryWheelGuard,
+  type LunaFuryReceiverLightMode,
+  LUNAFURY_SLEEP_OPTIONS,
+  lunafuryEncodeSleep,
+  lunafuryDecodeSleep,
+  lunafuryReceiverLightTarget,
+  lunafuryReadReceiverLight,
+  lunafuryWriteReceiverLight,
+  lunafuryDecodeReceiverLight,
+  lunafuryReadBottomButton,
+  lunafuryWriteBottomButton,
+  lunafuryDecodeBottomButton,
+  type LunaFuryBottomButtonMode,
   MAGNETIC_CALIBRATION_ERRORS,
   MAGNETIC_CALIBRATION_STATE,
   MAGNETIC_CALIBRATION_STEPS,
@@ -152,6 +181,7 @@ export class LamzuHidClient {
   private notifier: HIDDevice | null = null;
   private notifyListener: ((event: HIDInputReportEvent) => void) | null = null;
   private activeProfile = 1;
+  private onboardQueue: Promise<unknown> = Promise.resolve();
 
   readonly device: HIDDevice;
 
@@ -244,6 +274,7 @@ export class LamzuHidClient {
   }
 
   getSleepOptions(): readonly number[] {
+    if (this.deviceBrand() === "LunaFury") return LUNAFURY_SLEEP_OPTIONS;
     return this.profile()?.sleepOptions ?? SLEEP_SECONDS;
   }
 
@@ -284,13 +315,18 @@ export class LamzuHidClient {
     const activeProfileReply = await this.request(READ.activeProfile).catch(() => null);
     const profile = activeProfileReply ? Math.max(1, activeProfileReply[0]) : 1;
     this.activeProfile = profile;
-    const sleepTimeout = await this.request(PROFILE_READ.sleepTimeout(profile)).catch(() => null);
+    const luna = this.deviceBrand() === "LunaFury";
+    const sleepTimeout = await (luna ? this.readLunaFury(PROFILE_READ.sleepTimeout(profile))
+      : this.request(PROFILE_READ.sleepTimeout(profile))).catch(() => null);
     const debounce = await this.request(PROFILE_READ.debounce(profile)).catch(() => null);
-    const stages = this.decodeDpiStages(await this.request(PROFILE_READ.dpiStages(profile, this.maxDpiStages())));
-    const activeStage = this.stageIndex((await this.request(PROFILE_READ.activeStage(profile)))[1], stages.length);
+    const { stages } = await this.readDpiTable(profile);
+    const activeStage = luna
+      ? await this.readLunaFuryStage(profile, stages.length)
+      : this.stageIndex((await this.request(PROFILE_READ.activeStage(profile)))[1], stages.length);
     const pollingRate = await this.request(PROFILE_READ.pollingRate(profile));
     const liftOffDistance = await this.request(PROFILE_READ.liftOffDistance(profile));
-    const separateAxes = await this.request(PROFILE_READ.separateAxes(profile)).catch(() => null);
+    const separateAxes = await (luna ? this.readLunaFury(LUNAFURY_ONBOARD_READ.separateAxes(profile))
+      : this.request(PROFILE_READ.separateAxes(profile))).catch(() => null);
     const angleSnapping = await this.request(PROFILE_READ.angleSnapping(profile)).catch(() => null);
     const motionSync = await this.request(PROFILE_READ.motionSync(profile)).catch(() => null);
     const competitiveMode = await this.request(PROFILE_READ.competitiveMode(profile)).catch(() => null);
@@ -301,6 +337,7 @@ export class LamzuHidClient {
       : null;
     const lunafury = this.deviceBrand() === "LunaFury"
       ? await this.readLunaFurySettings(profile) : undefined;
+    const buttons = luna ? await this.readLunaFuryButtons(profile) : undefined;
     const stage = stages[activeStage];
     if (!stage) throw new Error("The mouse did not report any DPI stages.");
     const magneticButtons = this.profile()?.magnetic ? await this.readMagnetic(profile).catch(() => undefined) : undefined;
@@ -312,21 +349,26 @@ export class LamzuHidClient {
         family: this.profile()?.uiFamily ?? "lamzu",
         hideUnsupportedPollingRates: true,
         forceShowBattery: true,
+        ...(luna ? { dpiStageEditor: { maxStages: this.maxDpiStages(), countEditable: true,
+          minDpi: 50, maxDpi: this.maxDpi(), stepDpi: DPI_STEP } } : {}),
       },
       batteryPercent: battery[1] <= 100 ? battery[1] : null,
       batteryState: battery[0] === 1 ? "Charging" : "Discharging",
       dpi: stage.x,
       dpiY: stage.y,
-      supportsSeparateDpiAxes: separateAxes ? separateAxes[1] === 1 : false,
+      supportsSeparateDpiAxes: luna ? lunafuryDecodeSeparateAxes(separateAxes) !== undefined : separateAxes ? separateAxes[1] === 1 : false,
+      ...(luna ? { dpiStages: stages.map((item) => item.x), dpiStagesY: stages.map((item) => item.y), activeDpiStage: activeStage } : {}),
       pollingRateHz: this.decodePollingRate(pollingRate[1]),
       supportedPollingRates: this.getSupportedPollingRates(),
       activeProfile: activeProfileReply ? activeProfileReply[0] : null,
+      ...(luna && activeProfileReply && activeProfileReply[0] >= 1 && activeProfileReply[0] <= 3 ? { profileCount: 3 } : {}),
       angleSnapping: angleSnapping ? angleSnapping[1] === 1 : null,
       motionSync: motionSync ? motionSync[1] === 1 : null,
       performanceMode: competitiveMode ? competitiveMode[1] === 1 : null,
       hyperMode: hyperMode ? hyperMode[1] === 1 : null,
       rippleControl: rippleControl ? rippleControl[1] === 1 : null,
       ...(lunafury ? { lunafury: lunafury.settings, angleTuning: lunafury.angle } : {}),
+      ...buttons,
       dongleLedEnabled: dongleLed ? dongleLed[1] === 1 : null,
       connectionType: wireless ? "Wireless" : "Wired",
       connectionDetail: wireless ? "2.4 GHz receiver" : "Wired USB",
@@ -340,6 +382,10 @@ export class LamzuHidClient {
   }
 
   private async readLiveStatus(previous: MouseStatus): Promise<MouseStatus> {
+    if (this.deviceBrand() === "LunaFury") {
+      const profile = await this.currentProfile();
+      if (profile !== previous.activeProfile) return this.readStatus();
+    }
     const battery = await this.request(READ.battery);
     const pollingRate = await this.request(PROFILE_READ.pollingRate(this.activeProfile));
     return this.lastStatus = {
@@ -374,7 +420,223 @@ export class LamzuHidClient {
     const middleDebounceMs = lunafuryDecodeButtonDebounce(await optional(LUNAFURY_READ.buttonDebounce(profile, "middle")), "middle");
     const wheelGuard = lunafuryDecodeWheelGuard(await optional(LUNAFURY_READ.wheelGuard(profile)));
     const angle = lunafuryDecodeAngle(await optional(LUNAFURY_READ.angle(profile)));
-    return { settings: { lightningMode, leftDebounceMs, rightDebounceMs, middleDebounceMs, wheelGuard }, angle };
+    const buttonPollingRateHz = lunafuryDecodeButtonRate(await optional(LUNAFURY_ONBOARD_READ.buttonRate(profile)));
+    const separateDpiAxes = lunafuryDecodeSeparateAxes(await optional(LUNAFURY_ONBOARD_READ.separateAxes(profile)));
+    const receiverLightMode = lunafuryReceiverLightTarget(this.device.productId) !== undefined
+      ? lunafuryDecodeReceiverLight(await this.readReceiverLight(2).catch(() => null)) : undefined;
+    const bottomButtonMode = lunafuryDecodeBottomButton(await this.readLunaFuryBottomButton(profile, 2).catch(() => null), profile);
+    return { settings: { lightningMode, leftDebounceMs, rightDebounceMs, middleDebounceMs, wheelGuard,
+      ...(bottomButtonMode !== undefined ? { bottomButtonMode } : {}),
+      ...(receiverLightMode !== undefined ? { receiverLightMode } : {}),
+      ...(buttonPollingRateHz !== undefined ? { buttonPollingRateHz, supportedButtonPollingRates: this.getLunaFuryButtonPollingRates() } : {}),
+      ...(separateDpiAxes !== undefined ? { separateDpiAxes } : {}),
+    }, angle };
+  }
+
+  private readLunaFuryBottomButton(profile: number, attempts?: number): Promise<Uint8Array> {
+    return this.request({ ...lunafuryReadBottomButton(profile), attempts,
+      matchesReply: (reply) => reply[0] === profile && reply[1] === 0x14 && reply[2] === 0 });
+  }
+
+  async setLunaFuryBottomButtonMode(mode: LunaFuryBottomButtonMode): Promise<LunaFuryBottomButtonMode> {
+    this.requireLunaFury();
+    lunafuryWriteBottomButton(1, mode); // Validate before sending any request.
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      const previous = lunafuryDecodeBottomButton(await this.readLunaFuryBottomButton(profile), profile);
+      if (previous === undefined) throw new Error("The bottom-button binding is unsupported or unknown.");
+      await this.request(lunafuryWriteBottomButton(profile, mode));
+      const confirmed = lunafuryDecodeBottomButton(await this.readLunaFuryBottomButton(profile), profile);
+      if (confirmed !== mode) throw new Error("The mouse did not confirm the bottom-button mode.");
+      this.patchLunaFury({ bottomButtonMode: confirmed });
+      return confirmed;
+    });
+  }
+
+  getLunaFuryButtonPollingRates(): LunaFuryButtonPollingRate[] {
+    this.requireLunaFury();
+    return this.device.productId === 0x0032 ? [1000] : [1000, 2000, 4000, 8000];
+  }
+
+  private async readLunaFuryButton(profile: number, button: string, attempts?: number) {
+    const spec = lunafuryReadButton(profile, button);
+    const payload = await this.request({ ...spec, attempts,
+      matchesReply: (reply) => reply[0] === profile && reply[1] === spec.args[1] && reply[2] === 0 });
+    return lunafuryDecodeButton(payload, profile, button);
+  }
+
+  private async readLunaFuryButtons(profile: number): Promise<Partial<MouseStatus>> {
+    const buttonMappings: Record<string, string> = {};
+    const fixedButtons = ["Left"];
+    for (const button of Object.keys(LUNAFURY_BUTTON_IDS)) {
+      const binding = await this.readLunaFuryButton(profile, button, 2).catch(() => null);
+      if (!binding) continue; // An unsupported remapping read must not hide basic settings.
+      const action = lunafuryDecodeButtonAction(binding);
+      buttonMappings[button] = action;
+      if (button !== "Left" && !lunafuryButtonActionWritable(action)) fixedButtons.push(button);
+    }
+    return Object.keys(buttonMappings).length
+      ? { buttonMappings, fixedButtons, buttonOptions: [...LUNAFURY_BUTTON_ACTIONS] } : {};
+  }
+
+  async setButtonMapping(button: string, action: string): Promise<string> {
+    this.requireLunaFury();
+    if (!lunafuryIsMappedButton(button) || button === "Left") throw new Error("This LunaFury button is protected.");
+    // Validate before issuing even a read. Macro/unknown commands never become writes.
+    lunafuryWriteButton(1, button, action);
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      const previous = await this.readLunaFuryButton(profile, button);
+      if (!lunafuryButtonActionWritable(lunafuryDecodeButtonAction(previous))) {
+        throw new Error("Existing macros and unknown assignments are read-only.");
+      }
+      await this.request(lunafuryWriteButton(profile, button, action));
+      const confirmed = lunafuryDecodeButtonAction(await this.readLunaFuryButton(profile, button));
+      if (confirmed !== action) throw new Error("The mouse did not confirm the button assignment.");
+      if (this.lastStatus?.buttonMappings) this.patch({ buttonMappings: { ...this.lastStatus.buttonMappings, [button]: confirmed } });
+      return confirmed;
+    });
+  }
+
+  async setLunaFuryButtonPollingRate(hertz: LunaFuryButtonPollingRate): Promise<LunaFuryButtonPollingRate> {
+    this.requireLunaFury();
+    if (!this.getLunaFuryButtonPollingRates().includes(hertz)) throw new Error(`This mouse does not support ${hertz} Hz button polling.`);
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      await this.request(LUNAFURY_ONBOARD_WRITE.buttonRate(profile, hertz));
+      const confirmed = lunafuryDecodeButtonRate(await this.readLunaFury(LUNAFURY_ONBOARD_READ.buttonRate(profile)));
+      if (confirmed !== hertz) throw new Error("The mouse did not confirm the button polling rate.");
+      this.patchLunaFury({ buttonPollingRateHz: confirmed });
+      return confirmed;
+    });
+  }
+
+  /** Serialize multi-report edits so a profile switch cannot split an edit. */
+  private onboardOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.onboardQueue.then(operation, operation);
+    this.onboardQueue = run.catch(() => { this.lastStatus = null; });
+    return run;
+  }
+
+  private async readDpiTable(profile: number): Promise<{ raw: Uint8Array; stages: LamzuDpiStage[] }> {
+    const luna = this.deviceBrand() === "LunaFury";
+    const raw = luna ? await this.readLunaFury({ ...LUNAFURY_ONBOARD_READ.dpiStages(profile, this.maxDpiStages()), full: true })
+      : await this.request(PROFILE_READ.dpiStages(profile, this.maxDpiStages()));
+    return { raw, stages: luna ? lunafuryDecodeDpiStages(raw, this.maxDpiStages()) : this.decodeDpiStages(raw) };
+  }
+
+  private async readLunaFuryStage(profile: number, count: number): Promise<number> {
+    const reply = await this.readLunaFury(LUNAFURY_ONBOARD_READ.activeStage(profile));
+    if (reply.length < 2 || reply[1] < 1 || reply[1] > count) throw new Error("The mouse reported an invalid active DPI stage.");
+    return reply[1] - 1;
+  }
+
+  private patchDpiTable(stages: readonly LamzuDpiStage[], active: number): void {
+    this.patch({ dpiStages: stages.map((stage) => stage.x), dpiStagesY: stages.map((stage) => stage.y),
+      activeDpiStage: active, dpi: stages[active].x, dpiY: stages[active].y });
+  }
+
+  private async writeLunaFuryDpiTable(profile: number, raw: Uint8Array, stages: LamzuDpiStage[], active: number): Promise<void> {
+    await this.request(lunafuryWriteDpiStages(profile, stages, raw, this.maxDpiStages()));
+    const confirmed = (await this.readDpiTable(profile)).stages;
+    if (JSON.stringify(confirmed) !== JSON.stringify(stages)) throw new Error("The mouse did not confirm the complete DPI table.");
+    if (await this.readLunaFuryStage(profile, confirmed.length) !== active) throw new Error("The mouse did not keep the active DPI stage.");
+    this.patchDpiTable(confirmed, active);
+  }
+
+  async setProfile(profile: number): Promise<number> {
+    this.requireLunaFury();
+    const write = LUNAFURY_ONBOARD_WRITE.profile(profile);
+    return this.onboardOperation(async () => {
+      await this.request(write);
+      const confirmed = (await this.request(LUNAFURY_ONBOARD_READ.profile()))[0];
+      if (confirmed !== profile) throw new Error("The mouse did not confirm the onboard profile.");
+      this.activeProfile = profile;
+      this.lastStatus = null; // DPI, flags, latencies and rates all belong to the newly selected bank.
+      return confirmed;
+    });
+  }
+
+  async setActiveDpiStage(stage: number): Promise<number> {
+    this.requireLunaFury();
+    if (!Number.isInteger(stage) || stage < 0 || stage >= this.maxDpiStages()) throw new Error("Invalid DPI stage index.");
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      const { stages } = await this.readDpiTable(profile);
+      await this.request(LUNAFURY_ONBOARD_WRITE.activeStage(profile, stage, stages.length));
+      if (await this.readLunaFuryStage(profile, stages.length) !== stage) throw new Error("The mouse did not confirm the active DPI stage.");
+      this.patchDpiTable(stages, stage);
+      return stage;
+    });
+  }
+
+  async setDpiStageCount(count: number): Promise<number> {
+    this.requireLunaFury();
+    if (!Number.isInteger(count) || count < 1 || count > this.maxDpiStages()) throw new Error("Invalid DPI stage count.");
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      const { raw, stages } = await this.readDpiTable(profile);
+      let active = await this.readLunaFuryStage(profile, stages.length);
+      if (active >= count) {
+        active = count - 1;
+        await this.request(LUNAFURY_ONBOARD_WRITE.activeStage(profile, active, stages.length));
+        if (await this.readLunaFuryStage(profile, stages.length) !== active) throw new Error("The mouse did not confirm the active DPI stage.");
+      }
+      const next = stages.slice(0, count);
+      while (next.length < count) {
+        const offset = 2 + next.length * 4;
+        const x = (raw[offset] << 8) | raw[offset + 1];
+        const y = (raw[offset + 2] << 8) | raw[offset + 3];
+        const valid = (value: number) => value >= 50 && value <= this.maxDpi() && value % DPI_STEP === 0;
+        const fallback = LUNAFURY_DPI_DEFAULTS[next.length];
+        next.push(valid(x) && valid(y) ? { x, y } : { x: fallback, y: fallback });
+      }
+      await this.writeLunaFuryDpiTable(profile, raw, next, active);
+      return count;
+    });
+  }
+
+  async setDpiStageValue(stage: number, dpi: number): Promise<number> {
+    return this.setLunaFuryStageAxes(stage, dpi);
+  }
+
+  async setLunaFuryDpiStageAxes(stage: number, dpi: number, dpiY: number): Promise<number> {
+    return this.setLunaFuryStageAxes(stage, dpi, dpiY);
+  }
+
+  private async setLunaFuryStageAxes(stage: number | undefined, dpi: number, dpiY?: number): Promise<number> {
+    this.requireLunaFury();
+    lunafuryValidateDpi(dpi);
+    if (dpiY !== undefined) lunafuryValidateDpi(dpiY);
+    if (stage !== undefined && (!Number.isInteger(stage) || stage < 0 || stage >= this.maxDpiStages())) throw new Error("Invalid DPI stage index.");
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      const { raw, stages } = await this.readDpiTable(profile);
+      const active = await this.readLunaFuryStage(profile, stages.length);
+      const index = stage ?? active;
+      if (!stages[index]) throw new Error("This DPI stage is not enabled.");
+      const separate = dpiY === undefined ? lunafuryDecodeSeparateAxes(
+        await this.readLunaFury(LUNAFURY_ONBOARD_READ.separateAxes(profile)).catch(() => null),
+      ) : undefined;
+      // Axis lock controls sensor behaviour, not whether the Y value is
+      // stored. Explicit X/Y writes also restore dormant Y values in Games.
+      stages[index] = { x: dpi, y: dpiY ?? (separate === false ? dpi : stages[index].y) };
+      await this.writeLunaFuryDpiTable(profile, raw, stages, active);
+      return dpi;
+    });
+  }
+
+  async setLunaFurySeparateDpiAxes(enabled: boolean): Promise<boolean> {
+    this.requireLunaFury();
+    LUNAFURY_ONBOARD_WRITE.separateAxes(1, enabled);
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      await this.request(LUNAFURY_ONBOARD_WRITE.separateAxes(profile, enabled));
+      const confirmed = lunafuryDecodeSeparateAxes(await this.readLunaFury(LUNAFURY_ONBOARD_READ.separateAxes(profile)));
+      if (confirmed !== enabled) throw new Error("The mouse did not confirm the DPI axis mode.");
+      this.patchLunaFury({ separateDpiAxes: enabled });
+      return enabled;
+    });
   }
 
   private patchLunaFury(changes: Partial<LunaFurySettings>): void {
@@ -515,6 +777,17 @@ export class LamzuHidClient {
   }
 
   async setSleepTimeout(seconds: number): Promise<number> {
+    if (this.deviceBrand() === "LunaFury") {
+      const encoded = lunafuryEncodeSleep(seconds);
+      return this.onboardOperation(async () => {
+        const profile = await this.currentProfile();
+        await this.write(PAGE.device, WRITE.sleepTimeout, profile, [encoded >> 8, encoded & 0xff]);
+        const confirmed = lunafuryDecodeSleep(await this.readLunaFury(PROFILE_READ.sleepTimeout(profile)));
+        if (confirmed !== seconds) throw new Error("The mouse did not confirm the sleep timeout.");
+        this.patch({ sleepTimeout: confirmed });
+        return confirmed;
+      });
+    }
     if (!Number.isInteger(seconds) || seconds < 1 || seconds > SLEEP_MAX_SECONDS) {
       throw new Error(`The sleep timeout must be a whole number of seconds between 1 and ${SLEEP_MAX_SECONDS}.`);
     }
@@ -530,6 +803,7 @@ export class LamzuHidClient {
   }
 
   async setDpi(dpi: number, dpiY: number = dpi): Promise<number> {
+    if (this.deviceBrand() === "LunaFury") return this.setLunaFuryStageAxes(undefined, dpi, dpiY);
     const ceiling = this.maxDpi();
     for (const value of [dpi, dpiY]) {
       if (!Number.isInteger(value) || value < DPI_STEP || value > ceiling || value % DPI_STEP !== 0) {
@@ -679,6 +953,10 @@ export class LamzuHidClient {
 
   private async currentProfile(): Promise<number> {
     const reply = await this.request(READ.activeProfile);
+    if (this.deviceBrand() === "LunaFury" && (reply.length < 1 || reply[0] < 1 || reply[0] > 3)) {
+      throw new Error("The mouse did not report a valid LunaFury profile.");
+    }
+    if (this.deviceBrand() === "LunaFury" && this.lastStatus && this.lastStatus.activeProfile !== reply[0]) this.lastStatus = null;
     this.activeProfile = Math.max(1, reply[0]);
     return this.activeProfile;
   }
@@ -745,7 +1023,29 @@ export class LamzuHidClient {
   }
 
   private decodeSleepTimeout(payload: Uint8Array | null): number | null {
+    if (this.deviceBrand() === "LunaFury") return lunafuryDecodeSleep(payload);
     return compaxDecodeSleep(payload, SLEEP_DISABLED_MIN);
+  }
+
+  private readReceiverLight(attempts?: number): Promise<Uint8Array> {
+    return this.request({ ...lunafuryReadReceiverLight(this.device.productId), attempts,
+      matchesReply: (payload) => payload.length >= 3 && payload[0] === 1 });
+  }
+
+  async setLunaFuryReceiverLightMode(mode: LunaFuryReceiverLightMode): Promise<LunaFuryReceiverLightMode> {
+    this.requireLunaFury();
+    const spec = lunafuryWriteReceiverLight(this.device.productId, mode);
+    return this.onboardOperation(async () => {
+      // Read before writing: unsupported firmware must not receive a light write.
+      if (lunafuryDecodeReceiverLight(await this.readReceiverLight()) === undefined) {
+        throw new Error("The receiver did not report a supported light mode.");
+      }
+      await this.request(spec);
+      const confirmed = lunafuryDecodeReceiverLight(await this.readReceiverLight());
+      if (confirmed !== mode) throw new Error("The receiver did not confirm the light mode.");
+      this.patchLunaFury({ receiverLightMode: confirmed });
+      return confirmed;
+    });
   }
 
   private decodeFirmware(label: string, payload: Uint8Array | null): string {
