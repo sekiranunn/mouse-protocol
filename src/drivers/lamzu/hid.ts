@@ -301,6 +301,12 @@ export class LamzuHidClient {
   }
 
   async readStatus(live = false): Promise<MouseStatus> {
+    // A status read must not interleave a bank switch or repopulate its old cache.
+    return this.deviceBrand() === "LunaFury"
+      ? this.onboardOperation(() => this.readStatusNow(live)) : this.readStatusNow(live);
+  }
+
+  private async readStatusNow(live = false): Promise<MouseStatus> {
     await this.open();
     if (live && this.lastStatus) return await this.readLiveStatus(this.lastStatus);
     const wireless = this.isWireless();
@@ -382,14 +388,20 @@ export class LamzuHidClient {
   }
 
   private async readLiveStatus(previous: MouseStatus): Promise<MouseStatus> {
+    let dpi: Partial<MouseStatus> = {};
     if (this.deviceBrand() === "LunaFury") {
       const profile = await this.currentProfile();
-      if (profile !== previous.activeProfile) return this.readStatus();
+      if (profile !== previous.activeProfile) return this.readStatusNow();
+      const { stages } = await this.readDpiTable(profile);
+      const active = await this.readLunaFuryStage(profile, stages.length);
+      dpi = { dpiStages: stages.map((stage) => stage.x), dpiStagesY: stages.map((stage) => stage.y),
+        activeDpiStage: active, dpi: stages[active].x, dpiY: stages[active].y };
     }
     const battery = await this.request(READ.battery);
     const pollingRate = await this.request(PROFILE_READ.pollingRate(this.activeProfile));
     return this.lastStatus = {
       ...previous,
+      ...dpi,
       batteryPercent: battery[1] <= 100 ? battery[1] : null,
       batteryState: battery[0] === 1 ? "Charging" : "Discharging",
       pollingRateHz: this.decodePollingRate(pollingRate[1]),
@@ -516,6 +528,12 @@ export class LamzuHidClient {
     const run = this.onboardQueue.then(operation, operation);
     this.onboardQueue = run.catch(() => { this.lastStatus = null; });
     return run;
+  }
+
+  /** Older shared setters join LunaFury's queue without changing other brands. */
+  private profileOperation<T>(operation: (profile: number) => Promise<T>): Promise<T> {
+    const run = async () => operation(await this.currentProfile());
+    return this.deviceBrand() === "LunaFury" ? this.onboardOperation(run) : run();
   }
 
   private async readDpiTable(profile: number): Promise<{ raw: Uint8Array; stages: LamzuDpiStage[] }> {
@@ -645,44 +663,53 @@ export class LamzuHidClient {
 
   async setAngleTuning(degrees: number): Promise<number> {
     this.requireLunaFury();
-    const profile = await this.currentProfile();
-    await this.request(LUNAFURY_WRITE.angle(profile, degrees));
-    const confirmed = lunafuryDecodeAngle(await this.readLunaFury(LUNAFURY_READ.angle(profile)));
-    if (confirmed !== degrees) throw new Error(`The mouse did not confirm the ${degrees}° sensor angle.`);
-    this.patch({ angleTuning: confirmed });
-    return confirmed;
+    LUNAFURY_WRITE.angle(1, degrees);
+    return this.profileOperation(async (profile) => {
+      await this.request(LUNAFURY_WRITE.angle(profile, degrees));
+      const confirmed = lunafuryDecodeAngle(await this.readLunaFury(LUNAFURY_READ.angle(profile)));
+      if (confirmed !== degrees) throw new Error(`The mouse did not confirm the ${degrees}° sensor angle.`);
+      this.patch({ angleTuning: confirmed });
+      return confirmed;
+    });
   }
 
   async setLunaFuryLightningMode(mode: LunaFuryLightningMode): Promise<LunaFuryLightningMode> {
     this.requireLunaFury();
-    const profile = await this.currentProfile();
-    await this.request(LUNAFURY_WRITE.lightning(profile, mode));
-    const confirmed = lunafuryDecodeLightning(await this.readLunaFury(LUNAFURY_READ.lightning(profile)));
-    if (confirmed !== mode) throw new Error("The mouse did not confirm the Lightning Trigger mode.");
-    this.patchLunaFury({ lightningMode: confirmed });
-    return confirmed;
+    LUNAFURY_WRITE.lightning(1, mode);
+    return this.profileOperation(async (profile) => {
+      await this.request(LUNAFURY_WRITE.lightning(profile, mode));
+      const confirmed = lunafuryDecodeLightning(await this.readLunaFury(LUNAFURY_READ.lightning(profile)));
+      if (confirmed !== mode) throw new Error("The mouse did not confirm the Lightning Trigger mode.");
+      this.patchLunaFury({ lightningMode: confirmed });
+      return confirmed;
+    });
   }
 
   async setLunaFuryButtonDebounce(button: LunaFuryButton, milliseconds: number): Promise<number> {
     this.requireLunaFury();
-    const profile = await this.currentProfile();
-    await this.request(LUNAFURY_WRITE.buttonDebounce(profile, button, milliseconds));
-    const confirmed = lunafuryDecodeButtonDebounce(await this.readLunaFury(LUNAFURY_READ.buttonDebounce(profile, button)), button);
-    if (confirmed !== milliseconds) throw new Error(`The mouse did not confirm ${milliseconds} ms latency for the ${button} button.`);
-    this.patchLunaFury({ [`${button}DebounceMs`]: confirmed });
-    return confirmed;
+    LUNAFURY_WRITE.buttonDebounce(1, button, milliseconds);
+    return this.profileOperation(async (profile) => {
+      await this.request(LUNAFURY_WRITE.buttonDebounce(profile, button, milliseconds));
+      const confirmed = lunafuryDecodeButtonDebounce(await this.readLunaFury(LUNAFURY_READ.buttonDebounce(profile, button)), button);
+      if (confirmed !== milliseconds) throw new Error(`The mouse did not confirm ${milliseconds} ms latency for the ${button} button.`);
+      this.patchLunaFury({ [`${button}DebounceMs`]: confirmed });
+      return confirmed;
+    });
   }
 
   async setLunaFuryWheelGuard(guard: LunaFuryWheelGuard): Promise<LunaFuryWheelGuard> {
     this.requireLunaFury();
-    const profile = await this.currentProfile();
-    await this.request(LUNAFURY_WRITE.wheelGuard(profile, guard));
-    const confirmed = lunafuryDecodeWheelGuard(await this.readLunaFury(LUNAFURY_READ.wheelGuard(profile)));
-    if (!confirmed || confirmed.enabled !== guard.enabled || confirmed.windowMs !== guard.windowMs) {
-      throw new Error("The mouse did not confirm the wheel guard settings.");
-    }
-    this.patchLunaFury({ wheelGuard: confirmed });
-    return confirmed;
+    LUNAFURY_WRITE.wheelGuard(1, guard);
+    const wanted = { ...guard };
+    return this.profileOperation(async (profile) => {
+      await this.request(LUNAFURY_WRITE.wheelGuard(profile, wanted));
+      const confirmed = lunafuryDecodeWheelGuard(await this.readLunaFury(LUNAFURY_READ.wheelGuard(profile)));
+      if (!confirmed || confirmed.enabled !== wanted.enabled || confirmed.windowMs !== wanted.windowMs) {
+        throw new Error("The mouse did not confirm the wheel guard settings.");
+      }
+      this.patchLunaFury({ wheelGuard: confirmed });
+      return confirmed;
+    });
   }
 
   async setPollingRate(pollingRateHz: number): Promise<number> {
@@ -690,27 +717,31 @@ export class LamzuHidClient {
     if (!encoded || !this.getSupportedPollingRates().includes(pollingRateHz)) {
       throw new Error(`This mouse does not support ${pollingRateHz} Hz.`);
     }
-    const profile = await this.currentProfile();
-    await this.write(PAGE.profile, WRITE.pollingRate, profile, [encoded[0]]);
-    const confirmed = this.decodePollingRate((await this.request(PROFILE_READ.pollingRate(profile)))[1]);
-    if (confirmed !== pollingRateHz) {
-      throw new Error(`The mouse kept ${confirmed} Hz instead of ${pollingRateHz} Hz.`);
-    }
-    this.patch({ pollingRateHz: confirmed });
-    return confirmed;
+    return this.profileOperation(async (profile) => {
+      await this.write(PAGE.profile, WRITE.pollingRate, profile, [encoded[0]]);
+      const reply = await (this.deviceBrand() === "LunaFury" ? this.readLunaFury(PROFILE_READ.pollingRate(profile)) : this.request(PROFILE_READ.pollingRate(profile)));
+      const confirmed = this.decodePollingRate(reply[1]);
+      if (confirmed !== pollingRateHz) {
+        throw new Error(`The mouse kept ${confirmed} Hz instead of ${pollingRateHz} Hz.`);
+      }
+      this.patch({ pollingRateHz: confirmed });
+      return confirmed;
+    });
   }
 
   async setLiftOffDistance(value: LiftOffDistance): Promise<LiftOffDistance> {
     const encoded = LIFT_OFF_DISTANCES.find(([, name]) => name === value);
     if (!encoded) throw new Error(`This mouse does not support a ${value.toLowerCase()} lift-off distance.`);
-    const profile = await this.currentProfile();
-    await this.write(PAGE.profile, WRITE.liftOffDistance, profile, [encoded[0]]);
-    const confirmed = this.decodeLiftOffDistance((await this.request(PROFILE_READ.liftOffDistance(profile)))[1]);
-    if (confirmed !== value) {
-      throw new Error(`The mouse kept a ${String(confirmed).toLowerCase()} lift-off distance instead of ${value.toLowerCase()}.`);
-    }
-    this.patch({ liftOffDistance: confirmed });
-    return confirmed;
+    return this.profileOperation(async (profile) => {
+      await this.write(PAGE.profile, WRITE.liftOffDistance, profile, [encoded[0]]);
+      const reply = await (this.deviceBrand() === "LunaFury" ? this.readLunaFury(PROFILE_READ.liftOffDistance(profile)) : this.request(PROFILE_READ.liftOffDistance(profile)));
+      const confirmed = this.decodeLiftOffDistance(reply[1]);
+      if (confirmed !== value) {
+        throw new Error(`The mouse kept a ${String(confirmed).toLowerCase()} lift-off distance instead of ${value.toLowerCase()}.`);
+      }
+      this.patch({ liftOffDistance: confirmed });
+      return confirmed;
+    });
   }
 
   async setAngleSnapping(enabled: boolean): Promise<boolean> {
@@ -735,14 +766,15 @@ export class LamzuHidClient {
 
   async setDongleLed(enabled: boolean): Promise<boolean> {
     if (!this.profile()?.dongleLed) throw new Error("This receiver has no LED control.");
-    const profile = await this.currentProfile();
-    await this.request({
-      target: TARGET.dongle, page: PAGE.dongle, command: WRITE.dongleLed, length: 0x02, args: [profile, enabled ? 1 : 0],
+    return this.profileOperation(async (profile) => {
+      await this.request({
+        target: TARGET.dongle, page: PAGE.dongle, command: WRITE.dongleLed, length: 0x02, args: [profile, enabled ? 1 : 0],
+      });
+      const confirmed = (await this.request(PROFILE_READ.dongleLed(profile)))[1] === 1;
+      if (confirmed !== enabled) throw new Error(`The receiver left its LED ${confirmed ? "on" : "off"}.`);
+      this.patch({ dongleLedEnabled: confirmed });
+      return confirmed;
     });
-    const confirmed = (await this.request(PROFILE_READ.dongleLed(profile)))[1] === 1;
-    if (confirmed !== enabled) throw new Error(`The receiver left its LED ${confirmed ? "on" : "off"}.`);
-    this.patch({ dongleLedEnabled: confirmed });
-    return confirmed;
   }
 
   private async setFlag(
@@ -752,28 +784,32 @@ export class LamzuHidClient {
     field: "angleSnapping" | "motionSync" | "performanceMode" | "hyperMode" | "rippleControl",
     label: string,
   ): Promise<boolean> {
-    const profile = await this.currentProfile();
-    await this.write(PAGE.profile, command, profile, [enabled ? 1 : 0]);
-    const confirmed = (await this.request(read(profile)))[1] === 1;
-    if (confirmed !== enabled) {
-      throw new Error(`The mouse left ${label} ${confirmed ? "on" : "off"}.`);
-    }
-    this.patch({ [field]: confirmed });
-    return confirmed;
+    return this.profileOperation(async (profile) => {
+      await this.write(PAGE.profile, command, profile, [enabled ? 1 : 0]);
+      const reply = await (this.deviceBrand() === "LunaFury" ? this.readLunaFury(read(profile)) : this.request(read(profile)));
+      const confirmed = reply[1] === 1;
+      if (confirmed !== enabled) {
+        throw new Error(`The mouse left ${label} ${confirmed ? "on" : "off"}.`);
+      }
+      this.patch({ [field]: confirmed });
+      return confirmed;
+    });
   }
 
   async setDebounceTime(milliseconds: number): Promise<number> {
     if (!Number.isInteger(milliseconds) || milliseconds < 0 || milliseconds > DEBOUNCE_MAX_MS) {
       throw new Error(`Debounce must be a whole number of milliseconds between 0 and ${DEBOUNCE_MAX_MS}.`);
     }
-    const profile = await this.currentProfile();
-    await this.write(PAGE.device, WRITE.debounce, profile, [milliseconds]);
-    const confirmed = (await this.request(PROFILE_READ.debounce(profile)))[1];
-    if (confirmed !== milliseconds) {
-      throw new Error(`The mouse kept ${confirmed} ms of debounce instead of ${milliseconds} ms.`);
-    }
-    this.patch({ debounceMs: confirmed });
-    return confirmed;
+    return this.profileOperation(async (profile) => {
+      await this.write(PAGE.device, WRITE.debounce, profile, [milliseconds]);
+      const reply = await (this.deviceBrand() === "LunaFury" ? this.readLunaFury(PROFILE_READ.debounce(profile)) : this.request(PROFILE_READ.debounce(profile)));
+      const confirmed = reply[1];
+      if (confirmed !== milliseconds) {
+        throw new Error(`The mouse kept ${confirmed} ms of debounce instead of ${milliseconds} ms.`);
+      }
+      this.patch({ debounceMs: confirmed });
+      return confirmed;
+    });
   }
 
   async setSleepTimeout(seconds: number): Promise<number> {

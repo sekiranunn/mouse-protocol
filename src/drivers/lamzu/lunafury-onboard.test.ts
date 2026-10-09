@@ -7,10 +7,13 @@ import { LamzuHidClient } from "./hid.ts";
 function fixture(productId = 0x0033, options: { ignore?: string; stale?: string; unsupported?: boolean; truncate?: boolean } = {}) {
   let activeProfile = 1;
   const banks = Array.from({ length: 3 }, (_, index) => ({
-    count: 3, active: 2, axes: true, scan: 1, usb: 1,
+    count: 3, active: 2, axes: true, scan: 1, usb: 1, lod: 1, debounce: 0,
+    flags: {} as Record<number, number>, angle: 0, lightning: 0,
+    latency: [0, 0, 0, 3], wheel: false, window: 100,
     table: [400 + index * 50, 800, 800 + index * 50, 1600, 1600 + index * 50, 3200, 3200, 6400, 6400, 6400, 30000, 30000],
   }));
   const sent: Uint8Array[] = [];
+  const writes: Array<{ key: string; profile: number; activeProfile: number }> = [];
   let attempts = 0;
   const device = {
     vendorId: 0x373e, productId, productName: "LunaFury", opened: true,
@@ -18,12 +21,20 @@ function fixture(productId = 0x0033, options: { ignore?: string; stale?: string;
     sendFeatureReport: async (_id: number, packet: Uint8Array) => {
       const copy = new Uint8Array(packet); sent.push(copy); attempts = 0;
       const key = `${copy[4]}:${copy[5]}`;
+      if (copy[5] < 0x80 && key !== "0:5") writes.push({ key, profile: copy[6], activeProfile });
       if (options.ignore === key) return;
       const bank = banks[copy[6] - 1];
       if (key === "0:5") activeProfile = copy[6];
       if (!bank) return;
       if (key === "0:31") bank.scan = copy[7];
       if (key === "1:0") bank.usb = copy[7];
+      if (key === "1:8") bank.lod = copy[7];
+      if (key === "0:8") bank.debounce = copy[7];
+      if (copy[4] === 1 && [4, 9, 0x0a, 0x0b, 0x13].includes(copy[5])) bank.flags[copy[5]] = copy[7];
+      if (key === "1:20") bank.angle = copy[7] > 127 ? copy[7] - 256 : copy[7];
+      if (key === "0:24") bank.lightning = copy[7];
+      if (key === "0:18") bank.latency[copy[8]] = (copy[9] << 8) | copy[10];
+      if (key === "0:25") { bank.wheel = copy[7] === 1; bank.window = (copy[8] << 8) | copy[9]; }
       if (key === "1:2") bank.active = copy[7];
       if (key === "1:13") bank.axes = copy[7] === 1;
       if (key === "1:1") {
@@ -45,7 +56,13 @@ function fixture(productId = 0x0033, options: { ignore?: string; stale?: string;
       if (key === "1:130") payload = [profile, bank.active];
       if (key === "1:141") payload = [profile, +bank.axes];
       if (key === "1:128") payload = [profile, bank.usb];
-      if (key === "1:136") payload = [profile, 1];
+      if (key === "1:136") payload = [profile, bank.lod];
+      if (key === "0:136") payload = [profile, bank.debounce];
+      if (packet[4] === 1 && [0x84, 0x89, 0x8a, 0x8b, 0x93].includes(packet[5])) payload = [profile, bank.flags[packet[5] - 0x80] ?? 0];
+      if (key === "1:148") payload = [profile, bank.angle & 255];
+      if (key === "0:152") payload = [profile, bank.lightning, 0, 0];
+      if (key === "0:146") payload = [profile, 0, packet[8], 0, bank.latency[packet[8]], ...Array(14).fill(0)];
+      if (key === "0:153") payload = [profile, +bank.wheel, bank.window >> 8, bank.window & 255];
       if (key === "0:135") payload = [profile, 1, 44];
       const reply = new Uint8Array(64);
       reply[0] = options.unsupported && ["0:159", "1:141"].includes(key) ? 0xa2 : 0xa1;
@@ -57,7 +74,7 @@ function fixture(productId = 0x0033, options: { ignore?: string; stale?: string;
       return new DataView(buffer.buffer, 3, 64);
     },
   } as unknown as HIDDevice;
-  return { client: new LamzuHidClient(device), sent, banks, device };
+  return { client: new LamzuHidClient(device), sent, banks, device, writes };
 }
 
 test("LunaFury no longer exposes custom colors or sends color-table reads", async () => {
@@ -188,6 +205,66 @@ test("live status detects a profile switched outside this client", async () => {
   const status = await client.readStatus(true);
   assert.equal(status.activeProfile, 3);
   assert.deepEqual(status.dpiStages, [500, 900, 1700]);
+});
+
+for (const pid of [0x32, 0x33, 0x54, 0x84]) {
+  test(`LunaFury ${pid.toString(16)} live refresh reads physical DPI switches and changed tables`, async () => {
+    const { client, banks, sent } = fixture(pid);
+    await client.readStatus();
+    banks[0].active = 3;
+    let live = await client.readStatus(true);
+    assert.equal(live.activeDpiStage, 2);
+    assert.equal(live.dpi, 1600); assert.equal(live.dpiY, 3200);
+    banks[0].count = 4; banks[0].active = 4;
+    banks[0].table[6] = 2000; banks[0].table[7] = 4000;
+    live = await client.readStatus(true);
+    assert.equal(live.activeDpiStage, 3);
+    assert.equal(live.dpi, 2000); assert.equal(live.dpiY, 4000);
+    assert.deepEqual(live.dpiStages, [400, 800, 1600, 2000]);
+    assert.deepEqual(live.dpiStagesY, [800, 1600, 3200, 4000]);
+    assert.equal(sent.some((packet) => packet[5] < 0x80), false, "refresh must not write the device");
+  });
+}
+
+const oldSetters = [
+  ["USB polling", (client: LamzuHidClient) => client.setPollingRate(1000)],
+  ["LOD", (client: LamzuHidClient) => client.setLiftOffDistance("High")],
+  ["angle snap", (client: LamzuHidClient) => client.setAngleSnapping(true)],
+  ["motion sync", (client: LamzuHidClient) => client.setMotionSync(true)],
+  ["tracking", (client: LamzuHidClient) => client.setPerformanceMode(true)],
+  ["competitive", (client: LamzuHidClient) => client.setHyperMode(true)],
+  ["ripple", (client: LamzuHidClient) => client.setRippleControl(true)],
+  ["global debounce", (client: LamzuHidClient) => client.setDebounceTime(5)],
+  ["sensor angle", (client: LamzuHidClient) => client.setAngleTuning(-15)],
+  ["Lightning Trigger", (client: LamzuHidClient) => client.setLunaFuryLightningMode(1)],
+  ["button debounce", (client: LamzuHidClient) => client.setLunaFuryButtonDebounce("middle", 8)],
+  ["wheel guard", (client: LamzuHidClient) => client.setLunaFuryWheelGuard({ enabled: true, windowMs: 200 })],
+] as const;
+
+for (const [name, operation] of oldSetters) {
+  test(`${name} shares the LunaFury bank queue with switches, new edits and live reads`, async () => {
+    const { client, writes } = fixture();
+    await client.readStatus();
+    const [, , , , live] = await Promise.all([
+      operation(client), client.setProfile(2), client.setDpiStageValue(0, 2000), operation(client), client.readStatus(true),
+    ]);
+    assert.deepEqual(writes.map(({ profile, activeProfile }) => [profile, activeProfile]), [[1, 1], [2, 2], [2, 2]]);
+    assert.equal(live.activeProfile, 2, "a queued live read must not restore the previous bank cache");
+    assert.equal(live.dpiStages?.[0], 2000);
+    // Also cover the reverse ordering: a switch invoked first owns the next edit.
+    await Promise.all([client.setProfile(3), operation(client)]);
+    assert.deepEqual(writes.at(-1)?.profile, 3);
+    assert.equal(writes.at(-1)?.activeProfile, 3);
+  });
+}
+
+test("a rejected old setter does not stall later bank operations", async () => {
+  const { client, writes } = fixture(0x33, { ignore: "1:0" });
+  const results = await Promise.allSettled([client.setPollingRate(2000), client.setProfile(2), client.setDpiStageValue(0, 2000)]);
+  assert.equal(results[0].status, "rejected");
+  assert.equal(results[1].status, "fulfilled"); assert.equal(results[2].status, "fulfilled");
+  assert.ok(writes.every(({ profile, activeProfile }) => profile === activeProfile));
+  assert.equal((await client.readStatus(true)).activeProfile, 2);
 });
 
 test("new controls are gated to LunaFury and do not expose generic Lamzu banks", async () => {

@@ -28,6 +28,26 @@ over both cable and 8K: stage selection, value editing, separate axes, stage
 count changes and reconnect readback all worked. No separate Games or
 power-cycle results were supplied.
 
+## Live DPI and bank-operation regressions (2026-10-09)
+
+LunaFury live status now reads the current bank's DPI table and active stage,
+updating both axes instead of reusing the previous selected-stage cache.
+Physical DPI switches and changes to stage count/values are covered on all
+four runtime identities with synthetic HID fixtures. Refresh sends no writes
+and does not repeatedly read the static LunaFury extension controls.
+
+The older USB polling, LOD, flags, global debounce, sensor angle, Lightning
+Trigger, per-button latency and wheel-guard setters now share the onboard
+queue with bank switching and the newer setters. Their complete bank lookup,
+write and readback remain together. Status reads also join the queue, so a
+concurrent refresh cannot repopulate a switched bank's old cache. Shared
+setters retain their previous execution path for other brands.
+
+Regression tests interleave each older setter with profile switches, new
+DPI edits and live reads in both call orders, record the active bank at each
+write, and check that a failed operation does not stall later work. These
+are automated results, not new hardware validation.
+
 ## Bottom-button power / DPI behavior (2026-10-09, hardware unverified)
 
 At the owner's request, the three added fixed actions (left double click,
