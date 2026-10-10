@@ -40,8 +40,8 @@ checks excluded: `the probe matrix can trigger every driver` and
 `no device can be claimed by more than one driver`. This is not a full
 protocol CI result; both checks still need to run before merge.
 
-The paired OpenMouse build and all 349 application tests pass with the local
-protocol tarball, including 27 controller integration tests. The app still
+The paired OpenMouse build and all 367 application tests pass with the local
+protocol tarball, including 45 controller/Bridge integration tests. The app still
 pins the official `0.27.0` package, which lacks these APIs. See the
 [application development guide](https://github.com/sekiranunn/openmouse/blob/codex/lunafury-onboard-controls/docs/lunafury-development.md)
 for the paired setup and protocol-first release order.
@@ -86,6 +86,26 @@ restore the accumulated originals. Protocol source and packet definitions
 are unchanged in this round; its build, 151 focused tests, package dry-run
 and runtime audit were rerun. The 2,252-test broader result above comes from
 the earlier run. No additional hardware result is claimed.
+
+## Companion Games failure handling (2026-10-11)
+
+The driver's rejected-write errors now reach the consuming app's Games API
+as `failed`, rather than `written`. The app also reports a failed final
+status read and restores unrelated user staging in a `finally` block. Bridge
+does not record a successful signature or notify success for failed writes.
+It retains the accumulated original settings through failed and partial
+applications/restores, then retries on a later status poll.
+
+The app adds 18 integration cases, including ignored complete-table writes
+and restore retries on all four PIDs. Six run the actual Bridge hook callback
+with synthetic refs and a synthetic status subscription, alongside the real
+controller and driver. They check partial writes, retained backups, signature
+invalidation, retries and success-notification gating. No DOM renderer,
+native Bridge process or real device is used by these tests.
+
+Protocol code and packets are unchanged. Build, all 151 focused tests,
+package dry-run and runtime audit were rerun; the earlier 2,252-test result
+and full-CI exclusions above remain historical, not a new full protocol pass.
 
 ## Live DPI and bank-operation regressions (2026-10-09)
 
