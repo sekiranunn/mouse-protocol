@@ -40,8 +40,8 @@ checks excluded: `the probe matrix can trigger every driver` and
 `no device can be claimed by more than one driver`. This is not a full
 protocol CI result; both checks still need to run before merge.
 
-The paired OpenMouse build and all 334 application tests pass with the local
-protocol tarball, including 15 controller integration tests. The app still
+The paired OpenMouse build and all 349 application tests pass with the local
+protocol tarball, including 27 controller integration tests. The app still
 pins the official `0.27.0` package, which lacks these APIs. See the
 [application development guide](https://github.com/sekiranunn/openmouse/blob/codex/lunafury-onboard-controls/docs/lunafury-development.md)
 for the paired setup and protocol-first release order.
@@ -67,6 +67,25 @@ The application also resolves lower-priority legacy scalars before merging
 a new game's table snapshot. Both switch directions and restoration of the
 accumulated originals are covered through the real controller path. These
 are synthetic regressions; no new hardware or Bridge-process result is claimed.
+
+### Games switch composition
+
+The app now merges the complete backup with the next game's target before
+calling `setLunaFuryDpiStorage`. Enabled count and all stored X/Y slots are
+written together, followed by explicit stage selection if needed. There is
+no intermediate restore to the old count. This avoids deduplicating required
+writes against the previous game or sorting slot edits before expansion.
+An unchanged final table is not rewritten; dormant slots still come from
+the original backup, and the driver preserves TYPE33's trailing bytes.
+
+The controller suite includes three counterexamples on all four PIDs:
+shared edited DPI with a different selection, four-to-four with a new fourth
+slot, and maximum-count-to-four. Maximum count is six on LUNA33 and five on
+TYPE33. All 12 failed before the app fix and pass with it. The tests also
+restore the accumulated originals. Protocol source and packet definitions
+are unchanged in this round; its build, 151 focused tests, package dry-run
+and runtime audit were rerun. The 2,252-test broader result above comes from
+the earlier run. No additional hardware result is claimed.
 
 ## Live DPI and bank-operation regressions (2026-10-09)
 
