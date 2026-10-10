@@ -4,6 +4,12 @@ import type { CompaxDpiStage } from "../compx/codec.js";
  * Profiles and wire DPI stages are 1-based; the driver exposes stages 0-based.
  */
 export type LunaFuryButtonPollingRate = 1000 | 2000 | 4000 | 8000;
+/** Complete stored slots, separate from the enabled stage count. */
+export interface LunaFuryDpiStorage {
+  profile: number;
+  count: number;
+  stages: CompaxDpiStage[];
+}
 export const LUNAFURY_BUTTON_RATES = [[1, 1000], [32, 2000], [64, 4000], [128, 8000]] as const;
 export const LUNAFURY_DPI_DEFAULTS = [400, 800, 1600, 3200, 6400, 30000] as const;
 
@@ -74,6 +80,31 @@ export function lunafuryDecodeDpiStages(payload: Uint8Array, maxStages: number):
     lunafuryValidateDpi(y);
     return { x, y };
   });
+}
+
+export function lunafuryDecodeDpiStorage(payload: Uint8Array, maxStages: number): LunaFuryDpiStorage | undefined {
+  lunafuryDecodeDpiStages(payload, maxStages);
+  if (payload.length < 26) return undefined;
+  profile(payload[0]);
+  return { profile: payload[0], count: payload[1], stages: Array.from({ length: maxStages }, (_, index) => {
+    const offset = 2 + index * 4;
+    return { x: (payload[offset] << 8) | payload[offset + 1], y: (payload[offset + 2] << 8) | payload[offset + 3] };
+  }) };
+}
+
+/** Dormant slots may contain reserved values; preserve their exact 16-bit storage. */
+export function lunafuryWriteDpiStorage(storage: LunaFuryDpiStorage, previous: Uint8Array, maxStages: number) {
+  maximum(maxStages); profile(storage.profile); whole(storage.count, 1, maxStages, "DPI stage count");
+  if (!Array.isArray(storage.stages) || storage.stages.length !== maxStages) throw new Error("Incomplete LunaFury DPI storage.");
+  if (!lunafuryDecodeDpiStorage(previous, maxStages) || previous[0] !== storage.profile) throw new Error("DPI storage belongs to another profile or is incomplete.");
+  const args = Array.from(previous.slice(0, 26));
+  args[1] = storage.count;
+  storage.stages.forEach(({ x, y }, index) => {
+    whole(x, 0, 65535, "Stored X DPI"); whole(y, 0, 65535, "Stored Y DPI");
+    if (index < storage.count) { lunafuryValidateDpi(x); lunafuryValidateDpi(y); }
+    args.splice(2 + index * 4, 4, x >> 8, x & 255, y >> 8, y & 255);
+  });
+  return request(1, 1, 26, args);
 }
 
 /** Retain dormant slots and trailing vendor bytes in the fixed 26-byte table. */

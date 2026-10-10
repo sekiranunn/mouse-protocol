@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { compaxEncodeRequest } from "../compx/codec.ts";
 import { LUNAFURY_ONBOARD_READ as read, LUNAFURY_ONBOARD_WRITE as write,
-  lunafuryDecodeButtonRate, lunafuryDecodeSeparateAxes, lunafuryDecodeDpiStages, lunafuryWriteDpiStages } from "./lunafury-onboard.ts";
+  lunafuryDecodeButtonRate, lunafuryDecodeSeparateAxes, lunafuryDecodeDpiStages, lunafuryWriteDpiStages,
+  lunafuryDecodeDpiStorage, lunafuryWriteDpiStorage } from "./lunafury-onboard.ts";
 
 test("onboard commands use the vendor pages, lengths and one-based wire indices", () => {
   for (const [spec, prefix] of [
@@ -53,4 +54,19 @@ test("onboard codecs reject invalid profiles, counts, axes and truncated DPI tab
   const previous = Uint8Array.of(1, 1, 3, 32, 3, 32);
   for (const dpi of [0, 25, 51, 30050, NaN]) assert.throws(() => lunafuryWriteDpiStages(1, [{ x: dpi, y: 800 }], previous, 6));
   assert.throws(() => lunafuryWriteDpiStages(2, [{ x: 800, y: 800 }], previous, 6), /another profile/);
+});
+
+test("complete storage codec separates enabled count, dormant data and TYPE33 trailing bytes", () => {
+  const previous = Uint8Array.of(3, 1, 3, 32, 6, 64, ...Array.from({ length: 20 }, (_, index) => 100 + index));
+  assert.equal(lunafuryDecodeDpiStorage(previous.slice(0, 6), 6), undefined);
+  for (const max of [5, 6]) {
+    const saved = lunafuryDecodeDpiStorage(previous, max)!;
+    assert.equal(saved.count, 1); assert.equal(saved.stages.length, max);
+    assert.deepEqual(lunafuryWriteDpiStorage(saved, previous, max).args, [...previous]);
+    assert.throws(() => lunafuryWriteDpiStorage({ ...saved, profile: 2 }, previous, max), /another profile/);
+    assert.throws(() => lunafuryWriteDpiStorage({ ...saved, stages: saved.stages.slice(1) }, previous, max), /Incomplete/);
+    const reserved = { ...saved, stages: saved.stages.map((stage, index) => index === 1 ? { x: 0, y: 65535 } : stage) };
+    assert.deepEqual(lunafuryWriteDpiStorage(reserved, previous, max).args.slice(6, 10), [0, 0, 255, 255]);
+    assert.throws(() => lunafuryWriteDpiStorage({ ...reserved, count: 2 }, previous, max));
+  }
 });

@@ -25,6 +25,9 @@ import {
   lunafuryDecodeButtonRate,
   lunafuryDecodeSeparateAxes,
   lunafuryDecodeDpiStages,
+  lunafuryDecodeDpiStorage,
+  lunafuryWriteDpiStorage,
+  type LunaFuryDpiStorage,
   lunafuryValidateDpi,
   lunafuryWriteDpiStages,
   LUNAFURY_BUTTON_IDS,
@@ -325,7 +328,7 @@ export class LamzuHidClient {
     const sleepTimeout = await (luna ? this.readLunaFury(PROFILE_READ.sleepTimeout(profile))
       : this.request(PROFILE_READ.sleepTimeout(profile))).catch(() => null);
     const debounce = await this.request(PROFILE_READ.debounce(profile)).catch(() => null);
-    const { stages } = await this.readDpiTable(profile);
+    const { raw: dpiRaw, stages } = await this.readDpiTable(profile);
     const activeStage = luna
       ? await this.readLunaFuryStage(profile, stages.length)
       : this.stageIndex((await this.request(PROFILE_READ.activeStage(profile)))[1], stages.length);
@@ -373,7 +376,7 @@ export class LamzuHidClient {
       performanceMode: competitiveMode ? competitiveMode[1] === 1 : null,
       hyperMode: hyperMode ? hyperMode[1] === 1 : null,
       rippleControl: rippleControl ? rippleControl[1] === 1 : null,
-      ...(lunafury ? { lunafury: lunafury.settings, angleTuning: lunafury.angle } : {}),
+      ...(lunafury ? { lunafury: { ...lunafury.settings, dpiStorage: lunafuryDecodeDpiStorage(dpiRaw, this.maxDpiStages()) }, angleTuning: lunafury.angle } : {}),
       ...buttons,
       dongleLedEnabled: dongleLed ? dongleLed[1] === 1 : null,
       connectionType: wireless ? "Wireless" : "Wired",
@@ -392,10 +395,11 @@ export class LamzuHidClient {
     if (this.deviceBrand() === "LunaFury") {
       const profile = await this.currentProfile();
       if (profile !== previous.activeProfile) return this.readStatusNow();
-      const { stages } = await this.readDpiTable(profile);
+      const { raw, stages } = await this.readDpiTable(profile);
       const active = await this.readLunaFuryStage(profile, stages.length);
       dpi = { dpiStages: stages.map((stage) => stage.x), dpiStagesY: stages.map((stage) => stage.y),
-        activeDpiStage: active, dpi: stages[active].x, dpiY: stages[active].y };
+        activeDpiStage: active, dpi: stages[active].x, dpiY: stages[active].y,
+        lunafury: { ...previous.lunafury, dpiStorage: lunafuryDecodeDpiStorage(raw, this.maxDpiStages()) } };
     }
     const battery = await this.request(READ.battery);
     const pollingRate = await this.request(PROFILE_READ.pollingRate(this.activeProfile));
@@ -549,17 +553,46 @@ export class LamzuHidClient {
     return reply[1] - 1;
   }
 
-  private patchDpiTable(stages: readonly LamzuDpiStage[], active: number): void {
+  private patchDpiTable(stages: readonly LamzuDpiStage[], active: number, raw: Uint8Array): void {
     this.patch({ dpiStages: stages.map((stage) => stage.x), dpiStagesY: stages.map((stage) => stage.y),
       activeDpiStage: active, dpi: stages[active].x, dpiY: stages[active].y });
+    this.patchLunaFury({ dpiStorage: lunafuryDecodeDpiStorage(raw, this.maxDpiStages()) });
   }
 
   private async writeLunaFuryDpiTable(profile: number, raw: Uint8Array, stages: LamzuDpiStage[], active: number): Promise<void> {
     await this.request(lunafuryWriteDpiStages(profile, stages, raw, this.maxDpiStages()));
-    const confirmed = (await this.readDpiTable(profile)).stages;
+    const { raw: confirmedRaw, stages: confirmed } = await this.readDpiTable(profile);
     if (JSON.stringify(confirmed) !== JSON.stringify(stages)) throw new Error("The mouse did not confirm the complete DPI table.");
     if (await this.readLunaFuryStage(profile, confirmed.length) !== active) throw new Error("The mouse did not keep the active DPI stage.");
-    this.patchDpiTable(confirmed, active);
+    this.patchDpiTable(confirmed, active, confirmedRaw);
+  }
+
+  /** Restore enabled count and dormant slots in one bank-scoped transaction. */
+  async setLunaFuryDpiStorage(storage: LunaFuryDpiStorage): Promise<number> {
+    this.requireLunaFury();
+    const saved = structuredClone(storage);
+    return this.onboardOperation(async () => {
+      const profile = await this.currentProfile();
+      if (saved.profile !== profile) throw new Error("DPI backup belongs to another onboard profile.");
+      const { raw, stages } = await this.readDpiTable(profile);
+      const write = lunafuryWriteDpiStorage(saved, raw, this.maxDpiStages());
+      let active = await this.readLunaFuryStage(profile, stages.length);
+      if (active >= saved.count) {
+        active = saved.count - 1;
+        await this.request(LUNAFURY_ONBOARD_WRITE.activeStage(profile, active, stages.length));
+        if (await this.readLunaFuryStage(profile, stages.length) !== active) throw new Error("The mouse did not confirm the active DPI stage.");
+      }
+      await this.request(write);
+      const { raw: confirmedRaw, stages: confirmed } = await this.readDpiTable(profile);
+      const stored = lunafuryDecodeDpiStorage(confirmedRaw, this.maxDpiStages());
+      if (!stored || stored.count !== saved.count || stored.stages.some((stage, index) => stage.x !== saved.stages[index].x || stage.y !== saved.stages[index].y)
+        || raw.slice(2 + this.maxDpiStages() * 4, 26).some((byte, index) => byte !== confirmedRaw[2 + this.maxDpiStages() * 4 + index])) {
+        throw new Error("The mouse did not confirm the complete stored DPI table.");
+      }
+      if (await this.readLunaFuryStage(profile, confirmed.length) !== active) throw new Error("The mouse did not keep the active DPI stage.");
+      this.patchDpiTable(confirmed, active, confirmedRaw);
+      return saved.count;
+    });
   }
 
   async setProfile(profile: number): Promise<number> {
@@ -580,10 +613,10 @@ export class LamzuHidClient {
     if (!Number.isInteger(stage) || stage < 0 || stage >= this.maxDpiStages()) throw new Error("Invalid DPI stage index.");
     return this.onboardOperation(async () => {
       const profile = await this.currentProfile();
-      const { stages } = await this.readDpiTable(profile);
+      const { raw, stages } = await this.readDpiTable(profile);
       await this.request(LUNAFURY_ONBOARD_WRITE.activeStage(profile, stage, stages.length));
       if (await this.readLunaFuryStage(profile, stages.length) !== stage) throw new Error("The mouse did not confirm the active DPI stage.");
-      this.patchDpiTable(stages, stage);
+      this.patchDpiTable(stages, stage, raw);
       return stage;
     });
   }
@@ -594,6 +627,7 @@ export class LamzuHidClient {
     return this.onboardOperation(async () => {
       const profile = await this.currentProfile();
       const { raw, stages } = await this.readDpiTable(profile);
+      if (!lunafuryDecodeDpiStorage(raw, this.maxDpiStages())) throw new Error("Cannot change stage count without complete stored DPI data.");
       let active = await this.readLunaFuryStage(profile, stages.length);
       if (active >= count) {
         active = count - 1;

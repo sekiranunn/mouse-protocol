@@ -276,3 +276,58 @@ test("new controls are gated to LunaFury and do not expose generic Lamzu banks",
   await assert.rejects(client.setLunaFuryButtonPollingRate(8000), /only available on LunaFury/);
   assert.equal(sent.length, 0);
 });
+
+for (const pid of [0x32, 0x33, 0x54, 0x84]) {
+  test(`LunaFury ${pid.toString(16)} restores all stored slots without activating dormant reserved values`, async () => {
+    const { client, banks } = fixture(pid);
+    // Invalid as enabled DPI, but legitimate opaque storage while disabled.
+    banks[0].table[8] = 0; banks[0].table[9] = 65535;
+    const original = [...banks[0].table];
+    const saved = (await client.readStatus()).lunafury!.dpiStorage!;
+    assert.equal(saved.stages.length, pid === 0x32 || pid === 0x33 ? 6 : 5);
+    await client.setDpiStageCount(4);
+    await client.setLunaFuryDpiStageAxes(3, 2000, 4000);
+    await client.setActiveDpiStage(3);
+    await client.setLunaFuryDpiStorage(saved);
+    assert.equal(banks[0].count, 3); assert.equal(banks[0].active, 3);
+    assert.deepEqual(banks[0].table, original);
+    assert.deepEqual((await client.readStatus(true)).lunafury!.dpiStorage, saved);
+    await client.setDpiStageCount(4);
+    const reenabled = await client.readStatus(true);
+    assert.equal(reenabled.dpiStages![3], 3200); assert.equal(reenabled.dpiStagesY![3], 6400);
+    assert.deepEqual(banks[0].table, original);
+  });
+}
+
+test("stored DPI restores reject ignored writes and malformed or wrong-bank backups", async () => {
+  const { client, banks, writes } = fixture(0x33, { ignore: "1:1" });
+  const saved = (await client.readStatus()).lunafury!.dpiStorage!;
+  banks[0].table[6] = 2000;
+  await assert.rejects(client.setLunaFuryDpiStorage(saved), /complete stored/);
+  for (const invalid of [{ ...saved, count: 0 }, { ...saved, stages: saved.stages.slice(0, 3) },
+    { ...saved, stages: saved.stages.map((stage, index) => index === 0 ? { ...stage, x: 51 } : stage) }]) {
+    const count = writes.length;
+    await assert.rejects(client.setLunaFuryDpiStorage(invalid));
+    assert.equal(writes.length, count);
+  }
+  await client.setProfile(2);
+  const count = writes.length;
+  await assert.rejects(client.setLunaFuryDpiStorage(saved), /another onboard/);
+  assert.equal(writes.length, count);
+  await client.setProfile(1);
+  assert.equal((await client.readStatus(true)).activeProfile, 1, "a rejected restore must not stall the queue");
+});
+
+test("stored DPI backups are cloned before waiting for bank operations", async () => {
+  const { client, banks, writes } = fixture();
+  const saved = (await client.readStatus()).lunafury!.dpiStorage!;
+  const pending = client.setLunaFuryDpiStorage(saved);
+  saved.stages[0].x = 2000;
+  await pending;
+  assert.equal(banks[0].table[0], 400);
+  const [, result] = await Promise.allSettled([client.setProfile(2), client.setLunaFuryDpiStorage(saved)]);
+  assert.equal(result.status, "rejected");
+  assert.ok(writes.every(write => write.profile === write.activeProfile));
+  Object.defineProperty(client.device, "productId", { value: 0x001d });
+  await assert.rejects(client.setLunaFuryDpiStorage(saved), /only available on LunaFury/);
+});

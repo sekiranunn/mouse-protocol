@@ -1,4 +1,4 @@
-# LunaFury LUNA33 / TYPE33 protocol evidence
+# LunaFury LUNA33 / TYPE33 evidence and testing
 
 This integration is based on the public LunaFury WebHID configurator at
 <https://mouse.lunafury.games/>. The site and its source map were inspected on
@@ -9,24 +9,64 @@ This integration is based on the public LunaFury WebHID configurator at
 - `/js/output.xvi3.min.js` contains the `XviUpdater` transport and the concrete
   feature-report packets.
 
-The owner completed full-function testing on LUNA33 with firmware
-`0.0.26.0`, over both cable and 8K receiver connections. This verifies the
-LUNA33 runtime identities `0x0032` and `0x0033` on that firmware. TYPE33
-identities and packet layouts are source-verified but have not been tested
-on hardware.
+## Hardware results
 
-On 2026-10-08 the owner also confirmed the next round on LUNA33, firmware
-`0.0.26.0`, over both cable and 8K receiver: independent button polling,
-DPI stage management including X/Y axes, and all three onboard profiles
-worked normally. The owner subsequently confirmed mouse/scroll/DPI/media
-remapping, keyboard single keys and combinations on the same model, firmware
-and both connections. The owner further confirmed all four receiver light modes,
-absence of lighting controls over cable, sleep/Never over both connections,
-bank switching and reconnect readback. The redesigned official-style DPI UI
-was confirmed on 2026-10-08 by the owner on LUNA33, firmware 0.0.26.0,
-over both cable and 8K: stage selection, value editing, separate axes, stage
-count changes and reconnect readback all worked. No separate Games or
-power-cycle results were supplied.
+The owner confirmed full-function testing of the original LUNA33 support
+with firmware `0.0.26.0`, over cable and the 8K receiver. This verifies the
+runtime identities `0x0032` and `0x0033` on that firmware. They confirmed
+the later feature rounds on the same model, firmware and connections:
+
+| Feature | Owner-reported result |
+| --- | --- |
+| Independent button polling and all three onboard profiles | Normal over cable and 8K |
+| DPI stage selection, value editing, separate X/Y and stage count | Normal over cable and 8K, including the revised DPI UI |
+| Mouse, scroll, DPI and media remapping | Normal over cable and 8K |
+| Keyboard single keys and combinations | Normal over cable and 8K |
+| Sleep timeout and Never | Normal over cable and 8K |
+| Mixed, Battery, DPI and Off receiver lighting | Normal over 8K; lighting control absent over cable |
+| Bank switching and reconnect readback | Normal over cable and 8K |
+
+The button-polling/onboard round and the revised DPI editor were confirmed
+on 2026-10-08. These are the owner's reports, not independent hardware
+measurements. TYPE33 has source and synthetic-test coverage only. The new
+bottom-button power/DPI modes still need hardware testing, and no separate
+Games or power-cycle results were supplied.
+
+## Automated validation
+
+The protocol build and all 151 Lamzu driver/codec tests pass. A broader
+regression run on 2026-10-10 passed 2,252 tests with two registry exhaustive
+checks excluded: `the probe matrix can trigger every driver` and
+`no device can be claimed by more than one driver`. This is not a full
+protocol CI result; both checks still need to run before merge.
+
+The paired OpenMouse build and all 334 application tests pass with the local
+protocol tarball, including 15 controller integration tests. The app still
+pins the official `0.27.0` package, which lacks these APIs. See the
+[application development guide](https://github.com/sekiranunn/openmouse/blob/codex/lunafury-onboard-controls/docs/lunafury-development.md)
+for the paired setup and protocol-first release order.
+
+## Complete DPI restore regressions (2026-10-10)
+
+The enabled DPI arrays omit dormant slots. Status now also exposes
+`lunafury.dpiStorage`, containing the active bank, enabled count and all six
+LUNA33 or five TYPE33 X/Y slots. `setLunaFuryDpiStorage` restores that storage
+through the same bank-operation queue. It clones the backup before queuing,
+rejects another bank, validates enabled values, and preserves raw 16-bit
+values in dormant slots. TYPE33's remaining four table bytes stay unchanged.
+Readback checks the count, every stored slot, trailing bytes and active stage.
+
+The companion app keeps this backup in memory only; it is not an editable
+Games field and is excluded from saved snapshots and imports. Games count
+expansion followed by edits, restore and re-enabling the fourth slot is
+covered on all four runtime PIDs. Tests check the complete underlying table,
+not just the visible arrays. Additional tests cover reserved dormant values,
+ignored writes, malformed backups, bank switches and queue recovery.
+
+The application also resolves lower-priority legacy scalars before merging
+a new game's table snapshot. Both switch directions and restoration of the
+accumulated originals are covered through the real controller path. These
+are synthetic regressions; no new hardware or Bridge-process result is claimed.
 
 ## Live DPI and bank-operation regressions (2026-10-09)
 
@@ -43,32 +83,34 @@ write and readback remain together. Status reads also join the queue, so a
 concurrent refresh cannot repopulate a switched bank's old cache. Shared
 setters retain their previous execution path for other brands.
 
-Regression tests interleave each older setter with profile switches, new
-DPI edits and live reads in both call orders, record the active bank at each
-write, and check that a failed operation does not stall later work. These
-are automated results, not new hardware validation.
+Regression tests exercise older setters with profile switches, plus mixed
+old/new setters and live reads in both call orders. They record the active
+bank at each write and check that a failed operation does not stall later
+work. These tests use synthetic devices.
 
 ## Bottom-button power / DPI behavior (2026-10-09, hardware unverified)
 
-At the owner's request, the three added fixed actions (left double click,
-browser refresh and open browser) were withdrawn. They are absent from the
-official default menu. The previous verified DPI interface is retained.
-No hardware binding is automatically restored or overwritten by this rollback;
-existing removed assignments become unknown/read-only.
+The fixed actions for left double click, browser refresh and open browser
+were withdrawn because they are absent from the official default menu.
+The previous verified DPI interface is retained. Removing those actions
+does not rewrite a hardware binding; existing assignments using them remain
+unknown/read-only.
 
-The current official `settingDialog.vue` exposes two bottom-button modes:
+The official `settingDialog.vue` exposes two bottom-button modes:
+
 1. Short press: power on/off.
 2. Long press: power on/off; short press: DPI.
 
 `XviUpdater.getDpiPowerMode(profile)` reads target 2, page 3, command 0x80,
 length 6, selector `[profile, 0x14]`. Its setter writes:
+
 - Mode 1: length 5, `[profile, 0x14, 0, 0x15, 1]`.
 - Mode 2: length 6, `[profile, 0x14, 0, 7, 1, 6]`.
 
-The special five-byte power binding is not encoded as an ordinary button.
-The read validates bank, selector, function and data rather than treating
-every unknown function as mode 2 as the vendor UI does. Unsupported,
-truncated and unfamiliar bindings stay hidden and cannot be overwritten.
+The power binding has a special five-byte layout. The decoder validates
+bank, selector, function and data. The vendor UI treats unknown functions
+as mode 2; this driver hides unsupported, truncated and unfamiliar bindings
+and refuses to overwrite them.
 Writes reread the existing binding, run through the onboard operation
 queue, and confirm the exact selected mode. Ordinary buttons and other
 banks are not written. Other brands cannot call this setter.
@@ -88,17 +130,17 @@ disconnect it; turn it on again and reconnect before continuing.
 
 ## Official-style DPI editor (2026-10-08)
 
-At the owner's request, the custom DPI color extension was withdrawn. The
-LunaFury client no longer exposes a color setter or reads/writes the page-2
-color table. Other brands' color support is unchanged. A regression test
-checks that status reads and stage-count edits send no color-table commands.
+The custom DPI color extension was withdrawn. The LunaFury client has no
+color setter and does not read or write the page-2 color table. Other brands'
+color support is unchanged. A regression test checks that status reads and
+stage-count edits send no color-table commands.
 
 The app uses the official driver's fixed index palette, active-stage X/Y
 sliders, stage-value inputs and an explicit stage-count selector. Clicking a
 tile or focusing an input selects that stage. Numeric inputs clamp to
-50–30000 and round down in 50-DPI steps. The existing staged Apply workflow,
-serialized bank operations and readback-confirmed writes are preserved.
-Stage-count changes retain dormant device values as before.
+50 through 30000 and round down in 50-DPI steps. The existing staged Apply
+workflow, serialized bank operations and readback-confirmed writes are
+preserved. Stage-count changes retain dormant device values as before.
 
 Hardware retest: verify tile selection, value inputs, current-stage sliders,
 linked/separate axes, count shrink/expansion, undo/Apply and reconnect in
@@ -119,11 +161,12 @@ This receiver-global setting is deliberately excluded from Games profiles.
 
 Vendor `getSleepTime(profile)` reads page 0 command `0x87`; `setSleepTime`
 writes command 7, three bytes `[profile, secondsHigh, secondsLow]`. The UI
-offers 1–30 minutes, converting zero minutes to `0xffff` for Never. OpenMouse
-represents Never as zero seconds and preserves custom normal timeouts; zero
-wire values and other reserved values are not guessed. Only LunaFury uses this
-conversion. Sleep edits share the onboard-operation queue with profile
-switches and filter replies by profile before verifying the decoded timeout.
+offers 1 through 30 minutes, converting zero minutes to `0xffff` for Never.
+OpenMouse represents Never as zero seconds and preserves custom normal
+timeouts; zero wire values and other reserved values are not guessed. Only
+LunaFury uses this conversion. Sleep edits share the onboard-operation queue
+with profile switches and filter replies by profile before verifying the
+decoded timeout.
 
 Hardware checklist: record the current receiver mode and each bank's timeout.
 On the 8K receiver, apply Mixed/Battery/DPI/Off individually, inspect the LED,
@@ -132,10 +175,6 @@ For each connection, set a short sleep timeout, confirm actual idle sleep,
 then choose Never and wait beyond that timeout without using the mouse.
 Switch banks to check isolation, restore original values, and compare with
 the vendor configurator (never run both configurators concurrently).
-
-The owner has not supplied separate results for power-cycle persistence,
-other firmware versions, or native-Bridge end-to-end testing. The stated
-Corded/20 kHz behavior has not been independently measured.
 
 ## Runtime identities
 
@@ -167,7 +206,7 @@ CompX/XVI envelope implemented by `src/compx/codec.ts` and
 | --- | --- | --- |
 | Firmware | page `0x00`, command `0x81` | read only |
 | Battery | page `0x00`, command `0x83` | read only |
-| Active profile | page `0x00`, command `0x85` | read only |
+| Active profile | page `0x00`, command `0x85` | writable; see onboard controls below |
 | Polling rate | page `0x01`, command `0x80` | command `0x00`; `08/04/02/01/20/40/80` = 125 through 8000 Hz |
 | Sleep | page `0x00`, command `0x87` | command `0x07` |
 | Debounce | page `0x00`, command `0x88` | command `0x08` |
@@ -207,13 +246,13 @@ and disables after them; other brands retain their existing ordering.
 `XviUpdater.hidIndex` is 1: received WebHID buffers do not include the report
 ID. Decoders use the payload after the six-byte CompX header. Lightning mode
 and sensor angle are payload byte 1; button ID is byte 2 and button latency
-is bytes 3–4; wheel enable is byte 1 and its window is bytes 2–3.
+is bytes 3 and 4; wheel enable is byte 1 and its window is bytes 2 and 3.
 
-Left/right latency uses 0–15 ms in 1 ms steps; middle-button debounce uses
-1–30 ms. The 19-byte latency write payload is
+Left/right latency uses 0 through 15 ms in 1 ms steps; middle-button debounce
+uses 1 through 30 ms. The 19-byte latency write payload is
 `[profile, 0, buttonId, hi, lo, 0, 0, hi, lo, 0, 0, 0, 20, 0, 0, 0, 20, 0, 0]`.
-Wheel guard uses 20–200 ms in 20 ms steps. A disabled zero window is a valid
-read, not a guessed default; enabling it from that state proposes 100 ms.
+Wheel guard uses 20 through 200 ms in 20 ms steps. A disabled zero window is
+a valid read, not a guessed default; enabling it from that state proposes 100 ms.
 Writing a disabled zero window is supported so restoring a Games profile
 does not invent a different prior value.
 
@@ -238,12 +277,12 @@ settings can also be saved in Games profiles as a partial LunaFury namespace.
 Each profile restores only the controls it changed, preserving unrelated
 settings and valid zero values.
 
-## Required hardware check
+## Hardware checklist
 
 ### Onboard controls and button remapping
 
-The public configurator's runtime controls use profile IDs 1–3. Button scan
-rate is page 0, read `0x9f` / write `0x1f`, with codes 1/32/64/128 for
+The public configurator's runtime controls use profile IDs 1 through 3.
+Button scan rate is page 0, read `0x9f` / write `0x1f`, with codes 1/32/64/128 for
 1000/2000/4000/8000 Hz. LUNA33 cable offers only 1000 Hz. DPI stages use
 page 1, read `0x81` / write `0x01`, with a 26-byte table; active stage is
 read `0x82` / write `0x02`. Separate axes use `0x8d` / `0x0d`. Active
@@ -251,7 +290,7 @@ profile uses page 0, read `0x85` / write `0x05`.
 
 Button remapping uses page 3, read `0x80` / write `0x00`. The payload is
 `[profile, button, 0, function, dataLength, ...data]`. Reads request
-function `0xff`, data length 10 and envelope length 15. Physical IDs 1–5
+function `0xff`, data length 10 and envelope length 15. Physical IDs 1 through 5
 are left, right, middle, back and forward. Mouse actions use function 1;
 keyboard shortcuts use function 4 with `[modifierMask, HIDusage]`; media
 actions use function 5 with a big-endian consumer usage; DPI actions use
@@ -263,9 +302,9 @@ described above.
 The owner confirmed ordinary remapping on LUNA33 firmware `0.0.26.0` over
 both cable and the 8K receiver, as recorded above. TYPE33 remapping remains
 source-derived and synthetically tested only. Left is protected. Macros and
-unknown assignments remain read-only; no macro
-storage or unrelated button is rewritten. Each write addresses the active
-bank, reads the prior assignment, and checks the complete function/data
+unknown assignments remain read-only; no macro storage or unrelated button
+is rewritten. Each write addresses the active bank, reads the prior
+assignment, and checks the complete function/data
 readback. Reads match both profile and physical button. Profile switching
 and remapping share the serialized onboard-operation queue. Games profiles
 capture and restore only the supported buttons they touched.
